@@ -1,19 +1,18 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"sort"
 	"text/tabwriter"
 	"time"
 
-	// "github.com/jsleeio/cyklist/internal/autoscalingdiscovery"
 	"github.com/jsleeio/cyklist/internal/ec2discovery"
 	"github.com/jsleeio/cyklist/internal/ec2helpers"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
@@ -25,54 +24,48 @@ const (
 	AutoScalingGroupTag = "aws:autoscaling:groupName"
 )
 
-type config struct {
-	Region      *string
-	Session     *session.Session
-	EC2         *ec2.EC2
-	AutoScaling *autoscaling.AutoScaling
-	Phase       *string
-	NDetach     *int
-}
-
-func configureFromFlags() *config {
-	config := &config{
-		Region:  flag.String("region", "", "AWS region to operate in"),
-		Phase:   flag.String("phase", "", "Lifecycle phase to perform"),
-		NDetach: flag.Int("n-detach", 1, "Detach phase: number of instances to detach from their autoscaling groups"),
+func minint(a, b int) int {
+	if a < b {
+		return a
 	}
-	flag.Parse()
-	config.Session = session.Must(session.NewSession(&aws.Config{
-		Region:     aws.String(*config.Region),
-		LogLevel:   aws.LogLevel(aws.LogOff),
-		MaxRetries: 20,
-	}))
-	config.EC2 = ec2.New(config.Session)
-	config.AutoScaling = autoscaling.New(config.Session)
-	return config
+	return b
 }
 
-func tagForPhase(client *ec2.EC2, phase string, instances []*string) error {
-	if n := len(instances); n > 0 {
-		createtags := &ec2.CreateTagsInput{
-			Tags: []*ec2.Tag{
-				&ec2.Tag{Key: aws.String(TagPhaseName), Value: aws.String(TagPhaseValueDetach)},
-			},
-			Resources: []*string{},
-		}
-		if n > 100 {
-			n = 100
-		}
-		for _, instance := range instances[0:n] {
-			createtags.Resources = append(createtags.Resources, instance.InstanceId)
-		}
-		_, err := ctx.EC2.CreateTags(createtags)
-		if err != nil {
-			log.Fatalf("unable to tag EC2 instances: %v", err)
-		}
+func tagForPhase(phase string, instances []*ec2.Instance, cfg *config) error {
+	log.Printf("got %d instances for tagging", len(instances))
+	n := minint(100, len(instances))
+	if n < 1 {
+		return nil
 	}
+	createtags := &ec2.CreateTagsInput{
+		Tags: []*ec2.Tag{
+			&ec2.Tag{Key: aws.String(*cfg.ControlTag), Value: aws.String(phase)},
+		},
+		Resources: []*string{},
+	}
+	for _, instance := range instances[0:n] {
+		createtags.Resources = append(createtags.Resources, instance.InstanceId)
+	}
+	_, err := cfg.EC2.CreateTags(createtags)
+	return err
 }
 
-func detachInstances(client *autoscaling.AutoScaling, instances []*ec2.Instance) error {
+func listInstances(instances []*ec2.Instance, controltag string) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
+	fmt.Fprintf(w, "GROUP\tINSTANCE\tIMAGE\tPHASE\tLAUNCHED\n")
+	for _, instance := range instances {
+		tags := ec2helpers.MapTags(instance.Tags)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			tags.GetWithDefault(AutoScalingGroupTag, "-"),
+			*instance.InstanceId,
+			*instance.ImageId,
+			tags.GetWithDefault(controltag, "-"),
+			instance.LaunchTime.UTC().Format(time.RFC3339))
+	}
+	w.Flush()
+}
+
+func executeDetach(instances []*ec2.Instance, cfg *config) error {
 	// phase 1: map lists of instances to autoscaling groups
 	groupToInstances := make(map[string][]*string)
 	for _, instance := range instances {
@@ -83,8 +76,10 @@ func detachInstances(client *autoscaling.AutoScaling, instances []*ec2.Instance)
 			}
 		}
 		if autoscalingGroup == "" {
-			return fmt.Errorf("instance %s should have tag %s, but doesn't",
+			log.Printf("instance %s should have tag %s, but doesn't. Tagging for drain to make sure it eventually gets cleaned up",
 				*instance.InstanceId, AutoScalingGroupTag)
+			tagForPhase("drain", []*ec2.Instance{instance}, cfg)
+			continue
 		}
 		ii, ok := groupToInstances[autoscalingGroup]
 		if ok {
@@ -104,7 +99,7 @@ func detachInstances(client *autoscaling.AutoScaling, instances []*ec2.Instance)
 			InstanceIds:                    instances,
 			ShouldDecrementDesiredCapacity: aws.Bool(false),
 		}
-		_, err := client.DetachInstances(detach)
+		_, err := cfg.AutoScaling.DetachInstances(detach)
 		if err != nil {
 			return err
 		}
@@ -113,23 +108,29 @@ func detachInstances(client *autoscaling.AutoScaling, instances []*ec2.Instance)
 	return nil
 }
 
-func listInstances(instances []*ec2.Instance) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	fmt.Fprintf(w, "GROUP\tINSTANCE\tIMAGE\tPHASE\tLAUNCHED\n")
+func executeDrain(instances []*ec2.Instance, cfg *config) error {
 	for _, instance := range instances {
-		tags := ec2helpers.MapTags(instance.Tags)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			tags.GetWithDefault(AutoScalingGroupTag, "-"),
-			*instance.InstanceId,
-			*instance.ImageId,
-			tags.GetWithDefault("amiupdate.siteminder.io/phase", "-"),
-			instance.LaunchTime.UTC().Format(time.RFC3339))
+		log.Printf("%s: draining node", *instance.PrivateDnsName)
+		draincmd := exec.Command(*cfg.KubectlPath, "drain", "--timeout=1h",
+			"--ignore-daemonsets", "--delete-local-data", "--force",
+			*instance.PrivateDnsName)
+		if err := draincmd.Run(); err != nil {
+			log.Printf("%s: error draining node: %v", *instance.PrivateDnsName, err)
+			return err
+		} else {
+			log.Printf("%s: successfully drained (except daemonsets)", *instance.PrivateDnsName)
+		}
 	}
-	w.Flush()
+	return nil
 }
 
-func niy(x string) {
-	log.Fatalf("not implemented yet: %s", x)
+func executeTerminate(instances []*ec2.Instance, cfg *config) error {
+	tii := &ec2.TerminateInstancesInput{InstanceIds: []*string{}}
+	for _, instance := range instances {
+		tii.InstanceIds = append(tii.InstanceIds, instance.InstanceId)
+	}
+	_, err := cfg.EC2.TerminateInstances(tii)
+	return err
 }
 
 func main() {
@@ -137,30 +138,51 @@ func main() {
 	instances, err := ec2discovery.FilterInstances(
 		cfg.EC2,
 		[]*ec2.Filter{
-			ec2discovery.TagFilter("amiupdate.siteminder.io/enabled", "yes"),
-			ec2discovery.TagFilter("amiupdate.siteminder.io/phase", *cfg.Phase),
+			ec2discovery.TagFilter(*cfg.EnableTag, "yes"),
+			ec2discovery.TagFilter(*cfg.ControlTag, *cfg.Phase),
 		},
 		nil)
 	if err != nil {
 		log.Fatalf("unable to describe instances: %v", err)
 	}
-	n := len(instances)
+	// always pick the oldest instances first
+	sort.Slice(instances, func(i, j int) bool {
+		return instances[i].LaunchTime.Unix() < instances[j].LaunchTime.Unix()
+	})
+	subset := instances[0:minint(*cfg.MaxInstances, len(instances))]
+	if len(subset) < 1 {
+		// nothing to do
+		log.Printf("%s: nothing to do!", *cfg.Phase)
+		os.Exit(0)
+	}
+	if *cfg.ListOnly {
+		listInstances(subset, *cfg.ControlTag)
+		os.Exit(0)
+	}
+	var next string
 	switch *cfg.Phase {
 	case "detach":
-		if *cfg.NDetach <= 0 {
-			log.Fatal("--n-detach argument must be greater than zero")
-		}
-		if n == 0 {
-			log.Print("no matching instances, nothing to do")
-			os.Exit(0)
-		}
-		if *cfg.NDetach < n {
-			n = *cfg.NDetach
-		}
-		if err := detachInstances(cfg.AutoScaling, instances[0:n]); err != nil {
-			log.Fatal("error detaching instances: %v", err)
-		}
+		err = executeDetach(subset, cfg)
+		next = "drain"
+	case "drain":
+		err = executeDrain(subset, cfg)
+		next = "terminate"
+	case "terminate":
+		err = executeTerminate(subset, cfg)
+		next = ""
 	default:
-		niy(*cfg.Phase)
+		log.Fatalf("unknown phase: %s", *cfg.Phase)
+	}
+	if err != nil {
+		log.Fatalf("%s: error executing phase, not continuing: %v", *cfg.Phase, err)
+	}
+	if err = tagForPhase(next, subset, cfg); err != nil {
+		log.Fatalf("%s: error tagging %d instances for next phase %s: %v", *cfg.Phase, len(subset), next, err)
+	} else {
+		if next != "" {
+			log.Printf("%s: operated on %d instances and tagged them for next phase: %s", *cfg.Phase, len(subset), next)
+		} else {
+			log.Printf("%s: operated on %d instances", *cfg.Phase, len(subset))
+		}
 	}
 }
