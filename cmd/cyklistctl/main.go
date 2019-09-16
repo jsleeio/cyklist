@@ -108,6 +108,20 @@ func executeDetach(instances []*ec2.Instance, cfg *config) error {
 	return nil
 }
 
+func executeCordon(instances []*ec2.Instance, cfg *config) error {
+	for _, instance := range instances {
+		log.Printf("%s: cordoning node", *instance.PrivateDnsName)
+		cordoncmd := exec.Command(*cfg.KubectlPath, "cordon", *instance.PrivateDnsName)
+		if err := cordoncmd.Run(); err != nil {
+			log.Printf("%s: error cordoning node: %v", *instance.PrivateDnsName, err)
+			return err
+		} else {
+			log.Printf("%s: successfully cordoned", *instance.PrivateDnsName)
+		}
+	}
+	return nil
+}
+
 func executeDrain(instances []*ec2.Instance, cfg *config) error {
 	for _, instance := range instances {
 		log.Printf("%s: draining node", *instance.PrivateDnsName)
@@ -163,6 +177,9 @@ func main() {
 	switch *cfg.Phase {
 	case "detach":
 		err = executeDetach(subset, cfg)
+		next = "cordon"
+	case "cordon":
+		err = executeCordon(subset, cfg)
 		next = "drain"
 	case "drain":
 		err = executeDrain(subset, cfg)
@@ -174,6 +191,9 @@ func main() {
 		log.Fatalf("unknown phase: %s", *cfg.Phase)
 	}
 	if err != nil {
+		// if there were any errors, don't tag instances for the next phase
+		// this way they should get retried next time around and the system
+		// should cope with transient errors
 		log.Fatalf("%s: error executing phase, not continuing: %v", *cfg.Phase, err)
 	}
 	if err = tagForPhase(next, subset, cfg); err != nil {
