@@ -10,13 +10,13 @@ RUN sha512sum -c kubectl.sha512sum
 RUN tar -xzf kubectl.tgz
 
 FROM golang:1.12-alpine AS builder
-RUN apk add --no-cache git make
+RUN apk add --no-cache git
 ADD . /src
 RUN chown -R 1000:users /src
 USER 1000
 WORKDIR /src
 ENV GOCACHE=/tmp/.go-cache
-RUN make
+RUN go build -o cyklistctl ./cmd/cyklistctl
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates

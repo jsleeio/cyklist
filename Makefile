@@ -3,4 +3,3 @@
 
 cyklistctl:
 	go build ./cmd/cyklistctl/
-	rm -f cyklistctl
