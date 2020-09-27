@@ -1,6 +1,6 @@
 FROM alpine:latest AS downloader
-ARG kubectl_url="https://dl.k8s.io/v1.15.3/kubernetes-client-linux-amd64.tar.gz"
-ARG kubectl_sha512="93049dcadbe401fc2ed2f53ace598aa4bd183142ec2b7451d2a53e61c4bbc64f393639df166853cbf62c361839f87a386015c0be6b1a9a4d3c9fa84564d376ef"
+ARG kubectl_url="https://dl.k8s.io/v1.18.9/kubernetes-client-linux-amd64.tar.gz"
+ARG kubectl_sha512="e3a5cb14ac277959254dd64bfa0f5d6f09ce338d3bef9865bd5fa1cf828d56468de4d92a03b538042b6d13703403e1f54a54df574f2a12e9800da19939445eb0"
 RUN apk add curl
 USER 1000
 WORKDIR /tmp
@@ -9,7 +9,7 @@ RUN echo "${kubectl_sha512}  kubectl.tgz" | tee /tmp/kubectl.sha512sum
 RUN sha512sum -c kubectl.sha512sum
 RUN tar -xzf kubectl.tgz
 
-FROM golang:1.12-alpine AS builder
+FROM golang:1.15-alpine AS builder
 RUN apk add --no-cache git
 ADD . /src
 RUN chown -R 1000:users /src
