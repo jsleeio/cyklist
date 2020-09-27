@@ -112,8 +112,8 @@ func executeCordon(instances []*ec2.Instance, cfg *config) error {
 	for _, instance := range instances {
 		log.Printf("%s: cordoning node", *instance.PrivateDnsName)
 		cordoncmd := exec.Command(*cfg.KubectlPath, "cordon", *instance.PrivateDnsName)
-		if err := cordoncmd.Run(); err != nil {
-			log.Printf("%s: error cordoning node: %v", *instance.PrivateDnsName, err)
+		if output, err := cordoncmd.CombinedOutput(); err != nil {
+			log.Printf("%s: error cordoning node, kubectl output follows: %v\n%s\n", *instance.PrivateDnsName, err, string(output))
 			return err
 		} else {
 			log.Printf("%s: successfully cordoned", *instance.PrivateDnsName)
@@ -128,8 +128,8 @@ func executeDrain(instances []*ec2.Instance, cfg *config) error {
 		draincmd := exec.Command(*cfg.KubectlPath, "drain", "--timeout=1h",
 			"--ignore-daemonsets", "--delete-local-data", "--force",
 			*instance.PrivateDnsName)
-		if err := draincmd.Run(); err != nil {
-			log.Printf("%s: error draining node: %v", *instance.PrivateDnsName, err)
+		if output, err := draincmd.CombinedOutput(); err != nil {
+			log.Printf("%s: error draining node, kubectl output follows: %v\n%s\n", *instance.PrivateDnsName, err, string(output))
 			return err
 		} else {
 			log.Printf("%s: successfully drained (except daemonsets)", *instance.PrivateDnsName)
